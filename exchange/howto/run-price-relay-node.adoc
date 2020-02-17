@@ -152,6 +152,119 @@ http://YOUR_ONION_ADDRESS.onion/getAllMarketPrices
 
 Optional: If you support clear net access, test it with your IP/domain.
 
+=== Step 3. Setup network size metric data feed.
+
+Bisq uses the price node connection logs to get an estimation of the current Bisq P2P network size. The reasons are:
+
+- the logs are there anyways,
+- we can guesstimate the network size without any user tracking and
+- there is no data other than the Bisq version in these logs.
+
+Since the link:https://monitor.bisq.network/[monitor] only accepts plain TCP connections for incoming data, we have to accept a bit of overhead to keep the monitor from being flooded with unauthorized input. Thus, in order to successfully report to the monitor, we decided to go for TCP reverse proxy local to your host that can authenticate to the monitor.  The full stack is as follows:
+
+- the price node logs price requests to a logfile.
+- a scraper script that collects data from the logfile (`collectd` takes care of the script).
+- `collectd` supplies the data to the local reverse proxy
+- which forwards the data to the monitor after authenticating itself via clientssl authentication.
+
+Start by installing `nginx` on your system (for this guide, we go with nginx, if you prefer another reverse proxy, we are sure you can handle yourself).
+
+Then proceed to creating the SSL certificate that is later used to authenticate against the monitor:
+
+  cd /etc/nginx
+  openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/cert.key -out /etc/nginx/cert.crt
+
+Use `ON = bisq.network`, `OU = pricenode` and `CN = <your price nodes onion address here (without the ".onion" part)>` for certificate creation. The onion address can be found in the `hostname` file mentioned before.
+
+Configure the reverse proxy with clientssl enabled. You can simply append the snippet below to your `/etc/nginx/nginx.conf` file:
+
+----
+stream {
+	log_format basic '$remote_addr [$time_local] '
+	                 '$protocol Status $status Sent $bytes_sent Received $bytes_received '
+	                 'Time $session_time';
+
+	error_log syslog:server=unix:/dev/log;
+	access_log syslog:server=unix:/dev/log basic;
+
+	server {
+		listen 2003;
+		allow 127.0.0.1;
+		deny all;
+		proxy_pass monitor.bisq.network:2002;
+		proxy_ssl on;
+
+		proxy_ssl_certificate /etc/nginx/cert.crt;
+		proxy_ssl_certificate_key /etc/nginx/cert.key;
+
+		proxy_ssl_session_reuse on;
+	}
+}
+----
+
+Start your nginx and observe the logs to see if everything works as expected:
+
+  systemctl restart nginx
+  journalctl --unit nginx --follow
+
+Once you are satisfied, proceed on to installing https://collectd.org/[collectd] and use https://github.com/bisq-network/bisq-docs/blob/master/exchange/howto/collectd.conf[this^] collectd config to start from.
+
+- Fill in the onion address of your price node
+
+  Hostname "<ONION_ADDRESS again without the ".onion">"
+
+- Disable the Java-plugin
+
+	#LoadPlugin java
+
+- Save the log scraper script to disk and adjust the `journalctl` unit to your environment.
+
+----
+#!/bin/sh
+
+HOSTNAME="${COLLECTD_HOSTNAME:-localhost}"
+INTERVAL=750
+
+last=`date +"%F %T" -d "$INTERVAL seconds ago"`
+while true;
+do
+	now=`date +"%F %T"`
+
+	journalctl -u pricenode.service --since="$last" --until="$now" | grep -Eo "getAllMarketPrices.*bisq/[0-9].[0-9].[0-9]" | cut -d / -f 2 | sort | uniq -c | while read -r line; do
+		number=$(cut -d \  -f 1 <<< $line);
+		version=$(cut -d \  -f 2 <<< $line);
+		version=${version//./_};
+		echo "PUTVAL $HOSTNAME/requestsPer750Seconds/gauge-v$version interval=$INTERVAL N:$number";
+	done
+	last=$now
+
+	sleep $INTERVAL
+done
+----
+
+- Check if the script works by running it from the shell and see if it puts out lines like
+
+	PUTVAL localhost/requestsPer750Seconds/gauge-v1_2_2 interval=750 N:49
+
+- Activate the collectd exec plugin by appending the lines blow to your `collectd.conf`, adjust `user:group` to a user/group allowed to use `journalctl` and adjust the path to the scraper script.
+
+----
+LoadPlugin exec
+
+<Plugin exec>
+	Exec "user:group" "/path/to/your/scraper/script"
+</Plugin>
+----
+
+
+
+Start your collectd service and check the logs for any issues:
+
+  systemctl restart collectd
+  journalctl --unit collectd --follow
+
+Once you are satisfied, go ahead and report your client certificate (`/etc/nginx/cert.crt`) to the keybase `pricenode` channel (see <<Getting in Touch>>). The monitoring team will then whitelist your host and you can enjoy your metrics at https://monitor.bisq.network.
+
 
 == Monitoring
 
